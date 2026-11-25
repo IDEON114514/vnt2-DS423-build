@@ -1,0 +1,116 @@
+name: Build VNT2 for DS423+ (No AVX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnt_ref:
+        description: "vnt-dev/vnt 的 Tag 或分支名（如 v2.0.12 或 main）"
+        required: true
+        default: "v2.0.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout vnt-dev/vnt
+        uses: actions/checkout@v4
+        with:
+          repository: vnt-dev/vnt
+          ref: ${{ inputs.vnt_ref }}
+
+      - name: Inspect upstream build config
+        run: |
+          echo "=== .cargo/config.toml ==="
+          cat .cargo/config.toml 2>/dev/null || echo "(none)"
+          echo "=== upstream workflow flags ==="
+          grep -rnE 'cargo build|RUSTFLAGS|target-cpu|features' .github/workflows/ 2>/dev/null || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build vnt-web frontend
+        run: |
+          if [ -f package.json ]; then
+            npm install -g pnpm
+            pnpm install --frozen-lockfile || pnpm install
+            pnpm build:web
+          fi
+
+      - name: Install musl toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cmake pkg-config perl file qemu-user
+          sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+          sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build static x86_64-musl binaries without AVX
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-cpu=x86-64 -C
+          target-feature=-avx,-avx2,-fma,-bmi1,-bmi2,+crt-static"
+          CFLAGS: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+          CXXFLAGS: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+          CFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+          CXXFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+          CMAKE_C_FLAGS: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+          CMAKE_CXX_FLAGS: "-march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2"
+        run: |
+          if [ -f .cargo/config.toml ]; then
+            sed -i '/target-cpu/d' .cargo/config.toml || true
+          fi
+          python3 - << 'EOF'
+          import json, subprocess
+
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          wanted = {"vnt2_web", "vnt2_cli", "vnt2_ctrl"}
+          built = []
+          for pkg in meta["packages"]:
+              for tgt in pkg["targets"]:
+                  if "bin" in tgt["kind"] and tgt["name"] in wanted:
+                      feats = tgt.get("required-features", [])
+                      cmd = [
+                          "cargo", "build", "--release",
+                          "--target", "x86_64-unknown-linux-musl",
+                          "-p", pkg["name"],
+                          "--bin", tgt["name"],
+                      ]
+                      if feats:
+                          cmd += ["--features", ",".join(feats)]
+                      print("Building:", " ".join(cmd), flush=True)
+                      subprocess.check_call(cmd)
+                      built.append(tgt["name"])
+
+          if not built:
+              raise SystemExit("No vnt2_* binary targets found in workspace!")
+          print("Built binaries:", built)
+          EOF
+
+      - name: Verify static linking and test without AVX (QEMU)
+        run: |
+          mkdir -p dist
+          for bin in vnt2_web vnt2_cli vnt2_ctrl; do
+            p="target/x86_64-unknown-linux-musl/release/$bin"
+            if [ -f "$p" ]; then
+              cp "$p" "dist/$bin"
+              file "dist/$bin"
+              set +e
+              qemu-x86_64 -cpu qemu64,+sse4.1,+sse4.2,+aes,+popcnt,+movbe "dist/$bin" --help | head -n 8
+              rc=${PIPESTATUS[0]}
+              set -e
+              if [ "$rc" -eq 132 ]; then
+                echo "ERROR: $bin triggered SIGILL (132) under non-AVX CPU!"
+                exit 1
+              fi
+            fi
+          done
+          ls -lh dist/
+
+      - name: Upload DS423+ (No AVX) binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnt2-ds423-no-avx
+          path: dist/
